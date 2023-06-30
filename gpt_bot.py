@@ -1,5 +1,6 @@
 import logging
-import sqlite3
+import aiosqlite
+import asyncio
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -11,57 +12,60 @@ import os
 
 load_dotenv()
 
-# Введите ваш токен Telegram Bot и ключ API OpenAI
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
-# Установка ключа API OpenAI
 openai.api_key = OPENAI_API_KEY
-
-# Кодовая фраза для авторизации
 SECRET_PHRASE = os.getenv('SECRET_PHRASE')
 
-# Создание соединения с базой данных SQLite
-conn = sqlite3.connect('users.db', check_same_thread=False)
-cursor = conn.cursor()
-
-# Создание таблицы 'users', если она ещё не существует
-cursor.execute('''CREATE TABLE IF NOT EXISTS users
-             (user_id INTEGER PRIMARY KEY, is_authorized INTEGER)''')
-
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS message_history
-    (id INTEGER PRIMARY KEY, user_id INTEGER, message TEXT, is_bot INTEGER)''')
-
-
-# Настройка бота и диспетчера
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(bot, storage=MemoryStorage())
 dp.middleware.setup(LoggingMiddleware())
+
+db = None
+
+
+async def on_startup(dp):
+    logging.warning('Устанавливаем соединение с базой данных...')
+    global db
+    db = await aiosqlite.connect('users.db')
+    cursor = await db.cursor()
+    await cursor.execute('''CREATE TABLE IF NOT EXISTS users
+                            (user_id INTEGER PRIMARY KEY, is_authorized INTEGER)''')
+    await cursor.execute('''
+        CREATE TABLE IF NOT EXISTS message_history
+        (id INTEGER PRIMARY KEY, user_id INTEGER, message TEXT, is_bot INTEGER)''')
+    await db.commit()
+    logging.warning('Соединение с базой данных установлено...')
+
+
+async def on_shutdown(dp):
+    logging.warning('Закрываем соединение с базой данных...')
+    await db.close()
+    await dp.storage.close()
+    await dp.storage.wait_closed()
+    logging.warning('Бот остановлен')
 
 
 @dp.message_handler(commands='start')
 async def start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = cursor.fetchone()
+    cursor = await db.cursor()
+    await cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    user = await cursor.fetchone()
 
     if user is None:
-        # Новый пользователь, добавляем его в базу данных
-        cursor.execute("INSERT INTO users VALUES (?, 0)", (user_id,))
-        conn.commit()
-
+        await cursor.execute("INSERT INTO users VALUES (?, 0)", (user_id,))
+        await db.commit()
         await message.answer(
             'Привет! Я бот, обученный на базе GPT-3.5. Пожалуйста, введите кодовую фразу для авторизации.')
         await state.set_state("auth")
 
     elif user[1] == 0:
-        # Существующий пользователь, но еще не авторизован
         await message.answer('Пожалуйста, введите кодовую фразу для авторизации.')
         await state.set_state("auth")
 
     else:
-        # Существующий и авторизованный пользователь
         await message.answer('Добро пожаловать обратно! Чем я могу помочь?')
         await state.set_state("chat")
 
@@ -70,61 +74,80 @@ async def start(message: types.Message, state: FSMContext):
 async def auth(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     text = message.text
+    cursor = await db.cursor()
 
     if text == SECRET_PHRASE:
-        # Правильная кодовая фраза, авторизуем пользователя
-        cursor.execute("UPDATE users SET is_authorized=1 WHERE user_id=?", (user_id,))
-        conn.commit()
-
+        await cursor.execute("UPDATE users SET is_authorized=1 WHERE user_id=?", (user_id,))
+        await db.commit()
         await message.answer('Вы успешно авторизованы! Чем я могу помочь?')
         await state.set_state("chat")
 
     else:
-        # Неверная кодовая фраза
         await message.answer('Извините, кодовая фраза неверна. Попробуйте снова.')
         await state.set_state("auth")
+
+
+async def send_message_to_all_users(message: str):
+    cursor = await db.cursor()
+    await cursor.execute("SELECT user_id FROM users")
+    users = await cursor.fetchall()
+    for user in users:
+        try:
+            await bot.send_message(user[0], message)
+        except Exception as e:
+            logging.error(f"Произошла ошибка при отправке сообщения пользователю {user[0]}: {e}")
+
+
+async def stop_bot():
+    logging.warning('Останавливаем бота...')
+    await on_shutdown(dp)
+    await bot.close()
 
 
 @dp.message_handler(state="chat")
 async def respond(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     user_text = message.text
+    cursor = await db.cursor()
+    try:
+        await cursor.execute("INSERT INTO message_history (user_id, message, is_bot) VALUES (?, ?, 0)",
+                            (user_id, user_text))
+        await db.commit()
+        await cursor.execute("SELECT message FROM message_history WHERE user_id=? AND is_bot=1 ORDER BY id DESC LIMIT 1",
+                            (user_id,))
+        last_bot_message = await cursor.fetchone()
 
-    # Сохраняем сообщение пользователя в истории
-    cursor.execute("INSERT INTO message_history (user_id, message, is_bot) VALUES (?, ?, 0)", (user_id, user_text))
-    conn.commit()
+        if last_bot_message is None:
+            last_bot_message = ""
+        else:
+            last_bot_message = last_bot_message[0]
 
-    # Получаем последние 5 сообщений от пользователя
-    cursor.execute("SELECT message FROM message_history WHERE user_id=? ORDER BY id DESC LIMIT 5", (user_id,))
-    message_history = cursor.fetchall()
-
-    # Формируем подсказку из истории сообщений
-    prompt = " ".join([msg[0] for msg in reversed(message_history)])
-
-    # Делаем запрос к модели GPT-3.5
-    response = openai.Completion.create(
-        engine="text-davinci-003",  # используем модель GPT-3.5
-        prompt=prompt,
-        temperature=0.5,
-        max_tokens=1000
-    )
-
-    bot_response = response.choices[0].text.strip()
-
-    # Сохраняем ответ бота в истории
-    cursor.execute("INSERT INTO message_history (user_id, message, is_bot) VALUES (?, ?, 1)", (user_id, bot_response))
-    conn.commit()
-
-    await message.answer(bot_response)
-
-
-@dp.message_handler(commands='cancel', state="*")
-async def cancel(message: types.Message, state: FSMContext):
-    user = message.from_user
-    logging.info("Пользователь %s отменил разговор.", user.first_name)
-    await message.answer('До свидания!')
-    await state.finish()
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": last_bot_message},
+                {"role": "assistant", "content": user_text},
+            ]
+        )
+        bot_response = response['choices'][0]['message']['content']
+        await cursor.execute("INSERT INTO message_history (user_id, message, is_bot) VALUES (?, ?, 1)",
+                            (user_id, bot_response))
+        await db.commit()
+        await message.answer(bot_response)
+    except openai.Error as e:
+        logging.error(f"Произошла ошибка при взаимодействии с API OpenAI: {e}")
+        await send_message_to_all_users("Произошла ошибка при взаимодействии с API OpenAI. Бот временно недоступен.")
+        await stop_bot()
+        raise e
+    except Exception as e:
+        logging.error(f"Произошла неизвестная ошибка: {e}")
+        await send_message_to_all_users("Произошла неизвестная ошибка. Бот временно недоступен.")
+        await stop_bot()
+        raise e
 
 
-if __name__ == '__main__':
-    executor.start_polling(dp)
+if __name__ == "__main__":
+    from aiogram import executor
+
+    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown)
